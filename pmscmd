@@ -1,0 +1,1616 @@
+#!/usr/bin/env python
+import os
+import sys
+import commands
+import argparse
+import csv
+import ConfigParser
+import threading
+import subprocess
+import multiprocessing
+import textwrap
+import tempfile
+import getpass
+from collections import defaultdict
+from pprint import pprint
+
+import ansible.runner
+import ansible.playbook
+import ansible.inventory
+from ansible import callbacks
+from ansible import utils
+
+import re
+import string
+import random
+from passlib.hash import sha256_crypt
+import base64
+import crypt
+import logging
+import traceback
+import paramiko
+
+import MySQLdb
+import cx_Oracle
+import warnings
+from Crypto.Cipher import AES
+
+
+
+from itertools import islice
+import time
+from binascii import b2a_hex,a2b_hex
+
+with warnings.catch_warnings():
+    warnings.simplefilter("ignore")
+    import paramiko
+
+try:
+    import json
+except ImportError:
+    import simplejson as json
+
+try: 
+    import xlrd
+except ImportError:
+    _("Faild to import xlrd. Need install python-xlrd package.")
+
+MAIN_CFG_DIR='/etc/ansible'
+DEFAULT_SRC = os.path.join(MAIN_CFG_DIR, 'source.csv')
+DEFAULT_WHT = os.path.join(MAIN_CFG_DIR, 'white.csv')
+DEFAULT_INIT = os.path.join(MAIN_CFG_DIR, 'init.csv')
+DEFAULT_FILTER = os.path.join(MAIN_CFG_DIR, 'filter.csv')
+DEFAULT_STORE = os.path.join(MAIN_CFG_DIR, 'store.csv')
+DEFAULT_KEY = os.path.join(MAIN_CFG_DIR, 'pmskey.gpg')
+DEFAULT_PW_INVENTORY = os.path.join(MAIN_CFG_DIR, 'pw_inventory')
+ANSIBLE_CFG = os.path.join(MAIN_CFG_DIR, 'ansible.cfg')
+DEFAULT_GET = base64.b64decode
+DEFAULT_INTERVAL = '7d'
+CURRENT_TIME = time.time()
+
+DB_HOST = 'localhost'
+DB_PORT = 3306
+ORA_CONINFO = "pmsuser/Pmu#2016@10.1.248.238/ucmdb"
+MANAGED_USR = 'root'
+DB_USER = 'root'
+DB_PASSWD = ''
+DB_NAME = 'pms'
+DEFAULT_OS_TYPE = 'aix'
+LOG_PATH = '/var/log/pms.log'
+paramiko.util.log_to_file('/tmp/paramiko.log')
+logger = logging.getLogger('pms')
+logger.setLevel(logging.DEBUG)
+fh = logging.FileHandler(LOG_PATH)
+formatter = logging.Formatter('time=%(asctime)s  %(filename)s[line:%(lineno)d] %(levelname)s  operation=%(message)s ' ) 
+fh.setFormatter(formatter) 
+logger.addHandler(fh)
+
+
+SSH_NOK = []
+ACTION = ''
+encrypted_entry = multiprocessing.Manager().list()
+codeCodes = {
+    'red':       '0;31', 'green':     '0;32'
+}
+
+
+def con_Oracle():
+
+    src_files = [DEFAULT_SRC,DEFAULT_WHT]
+    writer_dic = {}
+    file_dic = {}
+    for i in src_files:
+        csvfile = file(i, 'wb')
+        writer = csv.writer(csvfile)
+        writer_dic[i] = writer
+        file_dic[i] = csvfile
+    con_orcl = None
+    try:
+        con_orcl = cx_Oracle.connect(ORA_CONINFO)
+    except cx_Oracle.DatabaseError as e:
+        logger_decorate('%s ##'% traceback.format_exc(),'error')
+        logger_decorate('Fail to connect to KanBan oracle,abruptly exit ##','error')
+        sys.exit(5)
+    if con_orcl:
+        logger_decorate('connect to KanBan oracle,start to dump out data.','info')
+        print "connect to KanBan oracle,start to dump out data."
+        cur_orcl = con_orcl.cursor()
+        cur_orcl.execute("select   distinct(cmdb_id),  A_HOSTNAME,  A_IPS ,A_GUESTOS from  kanban_guest.asset_os_pms g  where    A_IPS  != '-,-' and  (upper(g.A_GUESTOS) like '%LINUX%' or  upper(g.A_GUESTOS) like '%AIX%' or  upper(g.A_GUESTOS) like '%VIOS%')")
+        oracle_fetch = cur_orcl.fetchall()
+        con_orcl.close()
+        for i in  oracle_fetch:#遍历从oracle同步过来的数据并写入到source.csv文件
+            i = list(m.strip('[').strip(']') for m in i)
+            if '6.4'  in open('/etc/redhat-release').readline():#pmscmd运行在6.4时跟运行在其他版本上查询数据库的结果不一样？
+                if ('10.3' not  in  i[2] and '10.4' not in i[2]) or '.10.3' in i[2] or '.10.4' in i[2]:
+                    if i[3].lower().find('aix') != -1 or i[3].lower().find('vios') != -1:
+                        i.pop()
+                        i.extend([MANAGED_USR,'aix'])
+                    elif i[3].lower().find('linux') != -1:
+                        i.pop()
+                        i.extend([MANAGED_USR,'linux'])
+                    writer_dic[DEFAULT_SRC].writerow(i)
+            else:
+                if ('10.3' in  i[2] or '10.4' in i[2]) and not '.10.3' in i[2] and not '.10.4' in i[2]:
+                    if i[3].lower().find('aix') != -1 or i[3].lower().find('vios') != -1:
+                        i.pop()
+                        i.extend([MANAGED_USR,'aix'])
+                    elif i[3].lower().find('linux') != -1:
+                        i.pop()
+                        i.extend([MANAGED_USR,'linux'])
+                    writer_dic[DEFAULT_SRC].writerow(i)
+        for w in file_dic.values():
+            w.close()
+        logger_decorate('Success to get oracle data','info')
+        print "Success to get oracle data"
+        
+def mdb_con():
+    connector = None
+    try:
+        connector = MySQLdb.Connection(host=DB_HOST,port=DB_PORT,
+            user=DB_USER,passwd=DB_PASSWD,db=DB_NAME)
+    except MySQLdb.Error, e:
+        logger_decorate('connect to mysql db fails,query terminate.','error')
+        sys.exit('ERROR:can not connect to db, please check,failed')
+    return connector
+
+
+
+#################
+# filterPassword#
+#################
+reachable = []
+unreachable = []
+result = []
+def filter_check_connectable(hosts):#测试远端机器是否可以通过ansible进行ping
+    global reachable,unreachable,result
+
+    runner=ansible.runner.Runner(
+        module_name = 'ping',
+        host_list = hosts,
+        pattern = 'all',
+        forks = 100
+    )
+    result = runner.run()
+    unreachable = result['dark'].keys()
+    reachable = result['contacted'].keys()
+    
+    
+all_count = 0
+source_count = 0
+def check_run():#检查进程
+    previous = commands.getoutput("lsof -ni:22|grep python|grep -v grep|awk -F '->' '{print $2}'|awk  -F ':ssh' '{print $1}'|sort|uniq")
+    #previous = commands.getoutput("lsof -ni:22|grep -v grep|awk -F '->' '{print $2}'|awk  -F ':ssh' '{print $1}'|sort|uniq")
+    return previous.split()
+
+def source_monitor():#检查filter_check_connectable中
+    global source_count
+    previous_arr = check_run()#当前在ping的进程
+    diff = 0
+    while source_count < all_count:
+        time.sleep(0.5)
+        next_arr = check_run()
+        if  next_arr:
+            if previous_arr != next_arr:
+               diff = 1
+            for i in previous_arr:
+                if i not in next_arr:
+                    source_count += 1
+            previous_arr = next_arr
+        #elif not next_arr  and previous_arr:
+        if  diff == 1 and not next_arr:
+            source_count = all_count
+            sys.stdout.write('%d / %d'%(source_count,all_count)+'['.rjust(4)+('#' * int(source_count* 100/all_count)).ljust(100)+']\r')
+            time.sleep(0.5)
+            sys.stdout.flush()
+        else:
+            continue
+
+    
+def check_before_init():
+    global all_count,reachable
+    AUDIT_SRC = os.path.join(AUDIT_DIR,'source.audit')
+    init_files = [DEFAULT_INIT,AUDIT_SRC]
+    writer_dic = {}
+    file_dic = {}
+    for i in init_files:
+        csvfile = file(i, 'wb')
+        writer = csv.writer(csvfile)
+        file_dic[i] = csvfile
+        writer_dic[i] = writer
+    with open('/etc/ansible/source.csv','rb') as f:
+        rowlists = csv.reader(f)
+        aips = []
+        for rowline in rowlists:
+            rowline = [i.replace('-','').replace(' ','') for  i in rowline] 
+            for solo in rowline[2].split(','):
+                if solo:
+                    aips.append(solo)
+        aips = list(set(aips))
+        logger_decorate('begin to check hosts status of dumped data','info')
+        print "Begin to check hosts status of dumped data at background"
+        all_count = len(aips)
+        t1 = threading.Thread(target=filter_check_connectable, args=(aips,))
+        t1.start()
+        t2 = threading.Thread(target=source_monitor, args=())
+        t2.start()
+        while t2.is_alive():
+            if all_count:
+                sys.stdout.write('%d / %d'%(source_count,all_count)+'['.rjust(4)+('#' * int(source_count* 100/all_count)).ljust(100)+']\r')
+                time.sleep(0.5)
+                sys.stdout.flush()
+        print
+        while True:
+            if  not t1.is_alive():
+                f.seek(0)
+                print "begin to write init file"
+                for rowline in rowlists:
+                    rowline = [i.replace('-','').replace(' ','') for  i in rowline]
+                    for k in  rowline[2].split(','):
+                        if k in  reachable and k:
+                            writer_dic[DEFAULT_INIT].writerow([rowline[0].strip(),rowline[1].strip(),k,rowline[3].strip(),rowline[4].strip()])
+                            break
+                    else:
+                        writer_dic[AUDIT_SRC].writerow([rowline[0].strip(),rowline[1].strip(),rowline[2].strip(),rowline[3].strip(),rowline[4].strip()])
+                for w in file_dic.values():
+                    w.close()
+                break
+        logger_decorate('Success to refine dumped data','info')
+        print "Success to check hosts status,you can refer to audit log to analyze no ok hosts."
+                       
+def stringc(text, color):
+    return "\033["+codeCodes[color]+"m"+text+"\033[0m"
+    
+def check_f_exist(filename):
+    if os.path.exists(filename):
+        os.remove(filename)
+    else:
+        print "%s not exists,no need to clear" %filename
+
+class PasswordManagement(object):
+ 
+    def __init__(self): 
+        self.args = self.parse_args()
+        if sys.argv[1] == 'add':
+            ip = self.args.ip
+            user = self.args.user
+            ostype = self.args.ostype
+            uuid=self.args.uuid
+            hostname=self.args.hostname
+            connector = mdb_con()
+            dbworker = dbhandler(connector)
+            handle_single_entry(ip,user,ostype,uuid,hostname,dbworker,0)
+            dbworker.cursor.close()
+            connector.close()
+            print "add single entry successfully."
+        
+        elif sys.argv[1] == 'poll':#不把从oracle同步的数据写入source.csv,直接run
+            check_share_resource()
+        elif sys.argv[1] == 'source':#把从oracle同步的数据写入到source.csv
+            con_Oracle()
+            check_before_init()
+        elif sys.argv[1] == 'init':#把init.csv中的数据同步到数据库中
+            global ACTION
+            ACTION = 'init'
+            logger_decorate('begin to do init password action.','info')
+            print "Begin to do init password action..."
+            todolistforinitial = self.args.init
+            interval_time = self.args.time.replace(' ','')
+            reObj = re.compile(r'^\d+(?:\.\d+)?[d|D]\d+(?:\.\d+)?[h|H]$|^[\d]+[h|H]$|^[\d]+\.[\d]+[h|H]$|^[\d]+\.[\d]+[D|d]$|^[\d]+[D|d]$')
+            if reObj.match(interval_time):
+                interval_time = interval_time.lower()
+                interval_list = re.split('d|h',interval_time)
+                if len(interval_list) == 4:
+                    interval_time = 3600*24*eval(interval_list[0]) + 3600*eval(interval_list[1])
+                else:
+                    if 'h' in interval_time:
+                        interval_time = 3600*eval(interval_list[0])
+                    elif 'd' in interval_time:
+                        interval_time = 3600*24*eval(interval_list[0])
+            else:
+                _(stringc('ERROR:parameter \"interval_time\"" should be formated like \"2d4h\" or \"2d\" or \"1h\",float number supported.','red'))
+                logger_decorate('input interval_time format is not right,initPassword run terminate.','error')
+                sys.exit(6)
+            connector = mdb_con()
+            dbworker = dbhandler(connector)
+            logger_decorate('begin to initialize database,sync data from file.','info')
+            print "begin to initialize database,sync data from file"
+            deal_with_csv(None, todolistforinitial, dbworker,interval_time)#实际业务逻辑
+            dbworker.cursor.close()
+            connector.close()
+            logger_decorate('init action ends successfully.','info')
+            print "init action ends successfully."
+
+        elif sys.argv[1] == 'gen':
+            logger_decorate('begin to do generate password action.','info')
+            todolist = self.args.src
+            todolistfordb = self.args.dest
+            print "begin to do generate action"
+            generate_todolistfor_db_csv(todolist,todolistfordb)
+            logger_decorate('success to generate password.','info')
+            print "success to generate password"
+
+        elif sys.argv[1] == 'gpg':
+            filename = self.args.filename
+            isInit = self.args.opt
+            if isInit:
+                print 'do gpg init operation'
+                gpgrc,gpgous = commands.getstatusoutput('gpg --gen-key -t')
+                if gpgrc == 0:
+                    _('##gpg initialize success')
+                    sys.exit(0)
+                else:
+                    _(stringc('##gpg initialize Failed,%s'% gpgous,'red'))
+                    sys.exit(2)
+            if filename:
+                rc,token = commands.getstatusoutput("gpg --list-keys|grep ^pub|tail -1|awk -F '/' '{print $2}'|awk '{print $1}'")
+                if rc == 0:
+                    if not token:
+                        _(stringc("##fail to get the keyring of gpg,may be you have not initialized it,you can initialize by 'pmscmd  gpg -i'",'red')) 
+                        sys.exit(3)
+
+                    dorc,doget = commands.getstatusoutput("gpg -r %s --encrypt --always-trust %s" %(token,filename))
+                    if dorc == 0:
+                        print "token:",token
+                        print "filename",filename
+                        print '##encrypt file %s successfully!!!!!!!!!!!!!!!.'% filename
+                    else:
+                        _(stringc('##fail to encrypt file %s,please check whether gpg has been initialized.'% filename,'red')) 
+                        sys.exit(4)
+
+        elif sys.argv[1] == 'encrypt':
+            logger_decorate('begin to do password encryption action.','info')
+            todolistfordb = self.args.src
+            pw_inventory = self.args.inv
+            print "begin to do encrypt passord action"
+            generate_inventory(todolistfordb,pw_inventory)
+            logger_decorate('success to do  password encryption.','info')
+            print "success to do  password encryption"
+   
+
+        elif sys.argv[1] == 'update':
+            logger_decorate('begin to update password of remote machine.','info')
+            print "begin to do update password  action"
+            pw_inventory = self.args.inv
+            pb_result = start_ansible(pw_inventory)
+            malflag = None
+            for ikey in pb_result.keys():
+                if pb_result[ikey]['unreachable'] != 0:
+                    logger_decorate('fail to update %s password,%s'% (ikey,pb_result[ikey]),'warn')
+                    _(stringc('warn:fail to update  some hosts password,you can refer to audit log','red')) 
+                    malflag = True
+            else:
+                if not malflag:
+                    logger_decorate('success to update password of remote machine.','info')
+                    print "success to update password "
+        
+        elif sys.argv[1] == 'pingcheck':
+            ping_chk_f = self.args.ping_chkf
+            if not os.path.exists(ping_chk_f):
+                sys.exit('to be checked file not exists,please verify.')
+            sshf_obj = open(ping_chk_f,'r')
+            host_set = []
+            for line in sshf_obj:
+                host = line.strip('\r\n').split(',')[0]
+                if host not in host_set:
+                    host_set.append(host)
+            sshf_obj.close()
+            print "begin to check ping ability of remote machine[total:%s]"% str(len(host_set))
+            if host_set:
+                filter_check_connectable(host_set)
+                if not unreachable:
+                    print "##all hosts are pingable[total:%s]"% str(len(host_set))
+                    _("%s"%(host_set))
+                elif not reachable:
+                    print "##all hosts are not pingable[total:%s]"% str(len(host_set))
+                    _("%s"%(host_set))
+                else:
+                    print "##hosts which are pingable[total:%s]"% str(len(reachable))
+                    _("%s"%(reachable))
+                    print "##hosts which are not pingable[total:%s]"% str(len(unreachable))
+                    _("%s"%(unreachable))
+            else:
+                _("there are no host to be checked.")
+
+
+        elif sys.argv[1] == 'sshcheck':
+            global SSH_NOK
+            keyfile = self.args.keyfile
+            check_file_validate(keyfile)
+            key = unencrypt(keyfile)
+            today_date = time.strftime("%d")
+            mod = int(today_date) % 10
+            connector = mdb_con()
+            ssh_cur = connector.cursor()
+            ssh_cur.execute("select ip,name,hostname,password1 from user where id like '%%%s'" %mod)
+            checked_tuple = ssh_cur.fetchall()
+            print "start to check ssh connectivity of hosts"
+            if checked_tuple:
+                checked_list = list(checked_tuple)
+                times = len(checked_list) / 10
+                mod = len(checked_list) % 10
+                for i in range(0,times):
+                    threads = []
+                    next_n_lines = checked_list[n*i:n*(i+1)]
+                    if next_n_lines:
+                        for line in next_n_lines:
+                            line = list(line)
+                            readablepass = decrypt([line[3]], key)
+                            line.pop()
+                            line.append(''.join(readablepass))
+                            t = threading.Thread(target=ssh_check, args=(line,))
+                            t.start()
+                            threads.append(t)
+                        for t in threads:
+                            t.join()
+                if mod:
+                    remain_lines = checked_list[-mod:]
+                    remain_threads = []
+                    for line in remain_lines:
+                        line=list(line)
+                        readablepass = decrypt([line[3]], key)
+                        line.pop()
+                        line.append(''.join(readablepass))
+                        t = threading.Thread(target=ssh_check, args=(line,))
+                        t.start()
+                        remain_threads.append(t)
+                    for t in remain_threads:
+                        t.join()
+                with open('/var/log/%s_sshcheck.log'% time.strftime("%Y_%m_%d"),'a') as f:
+                    f.write('sample hosts:%s\n' %checked_list)
+                    f.write("##ssh nok ip[total:%s] %s\n" %(len(SSH_NOK),SSH_NOK))
+                f.close()
+                connector.close()
+                print 'Finsh checking hosts'
+
+        elif sys.argv[1] == 'store':
+            ACTION = 'store'
+            todolistfordb = self.args.src
+            keyfile = self.args.keyfile
+            check_file_validate(keyfile)
+            key = unencrypt(keyfile)
+            logger_decorate('begin to do ssh checking of remote machines.','info')
+            t = threading.Thread(target=ssh_parallel_check, args=(todolistfordb,))
+            t.start()
+            _('### Checking ssh status at background, please waiting:')
+            while t.is_alive():
+                if all_count:
+                    sys.stdout.write('%d / %d'%(ssh_count,all_count)+'['.rjust(4)+('#' * int(ssh_count* 100/all_count)).ljust(100)+']\r')
+                    time.sleep(0.5)
+                    sys.stdout.flush()
+            logger_decorate('finish check ssh status of all hosts.','info')
+            logger_decorate('begin to do store action.','info')
+            connector = mdb_con()
+            dbworker = dbhandler(connector)
+            logger_decorate('connected to database,begin to store data.','info')
+            print "begin to populate ssh-reachable host to mysql and oracle..."
+            deal_with_csv(key, todolistfordb, dbworker,0)
+            logger_decorate('store to db finish.','info')
+            key_cursor = dbworker.cursor
+            key_cursor.execute('select count(*) from private_key')
+            rets = key_cursor.fetchone()
+            if  rets[0] == 0:
+                key_cursor.execute('insert into private_key values("%s")'% key)#保存key文件内容，在查询密码是，如果key文件与数据库中保存的值不一致则无法检出密码，key文件不参与实际的加密过程
+                connector.commit()
+                logger_decorate('push private key to database.','info')
+            key_cursor.close()
+            connector.close()
+            update_key(key)
+            logger_decorate('finish updating key.','info')
+            logger_decorate('store action ends successfully.','info')
+            _('##store action ends successfully')
+            
+        elif sys.argv[1] == 'filter':
+            logger_decorate('begin to do filter action','info')
+            destlist = self.args.dest
+            delta = self.args.time.replace(' ','')
+            reObj = re.compile(r'^\d+(?:\.\d+)?[d|D]\d+(?:\.\d+)?[h|H]$|^[\d]+[h|H]$|^[\d]+\.[\d]+[h|H]$|^[\d]+\.[\d]+[D|d]$|^[\d]+[D|d]$')
+            if reObj.match(delta):
+                delta = delta.lower()
+                interval_list = re.split('d|h',delta)
+                if len(interval_list) == 4:
+                    delta = 3600 * 24 * eval(interval_list[0]) + 3600 * eval(interval_list[1])
+                else:
+                    if 'h' in delta:
+                        delta = 3600 * eval(interval_list[0])
+                    elif 'd' in delta:
+                        delta = 3600 * 24 * eval(interval_list[0])
+            else:
+                logger_decorate('parameter interval_time not correctly formatted,filter terminate.','error')
+                sys.exit('ERROR:parameter \"interval_time\"" should be formated like \"2d4h\" or \"2d\" or \"1h\",float supported.')
+            connector = mdb_con()
+            logger_decorate('connect database,start filtering','info')
+            yield_source(connector,delta,destlist)
+
+        elif sys.argv[1] == 'query':
+            logger_decorate('begin to do query action.','info')
+            global is_all
+            is_all = self.args.all
+            is_raw = self.args.raw
+            ips = self.args.ip
+            user = self.args.user
+            keyfile = self.args.keyfile
+            check_file_validate(keyfile)
+            key = unencrypt(keyfile)
+            ip_list = ips.strip('[]').split(',')
+            pattern = re.compile(r'^(?:(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\.){3}(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)$')
+            for i in ip_list:
+                if not pattern.match(i):
+                    _("error:ip-list should be list type,please confirm.")
+                    logger_decorate('input format not correct,list terminate.','error')
+                    sys.exit(7)
+            connector1 = mdb_con()
+            curs = connector1.cursor()
+            check_key = "select fingerprint from private_key"
+            curs.execute(check_key)
+            results = curs.fetchone()
+            if results:
+                if key != results[0]:
+                    _("WARN:provided key isn't consistent with previous,query forbbiden.")
+                    logger_decorate('key not matched,query terminate.','error')
+                    sys.exit(3)
+            for i in ip_list:
+                result = getEncrypted(i,user)
+                if result:
+                    if not is_raw:
+                        result = decrypt(result, key)
+                    print '%s,%s===>%s'%(i,user,result)
+                else:
+                    print '%s,%s===>null'%(i,user)
+            connector1.close()
+            logger_decorate('query action finish.','info')
+
+        elif sys.argv[1] == 'delete':
+            ACTION = 'delete'
+            uuid = self.args.uuid
+            ret_staus = del_invalid_host(uuid)
+            if ret_staus:
+                if ret_staus == 4:
+                    sys.exit(4)
+                else:
+                    sys.exit(1024)
+                    
+        elif sys.argv[1] == 'hmc':
+            if not (self.args.ip or self.args.file):
+                sys.exit('pmscmd: error: No action provided,add --ip or -- file')
+            elif self.args.ip and self.args.file:
+                sys.exit('pmscmd: error: Only one action should be provided,add --ip or -- file')
+            hmc_conn = mdb_con()
+            print 'success to build con to mysql'
+            hmc_orc_conn = cx_Oracle.connect(ORA_CONINFO)
+            print 'succcess to build con to oracle'
+            if self.args.file:
+                with open(self.args.file) as obj:
+                    for i in obj:
+                        i = i.strip('\n')
+                        ping_rc,ping_ret = commands.getstatusoutput('fping %s' %i)
+                        if ping_rc == 0:
+                            print ping_ret
+                            ret = manage_hmc_proc(i,hmc_conn,hmc_orc_conn,'init')
+                            if not ret:
+                                print 'succcess to manage hmc host',i
+                            else:
+                                print 'fail to manage hmc host',i
+                        else:
+                            print i,'is unreachable,skip to manage'
+            elif self.args.ip:
+                ping_rc,ping_ret = commands.getstatusoutput('fping %s' %self.args.ip)
+                if ping_rc == 0:
+                     print ping_ret
+                     ret = manage_hmc_proc(self.args.ip,hmc_conn,hmc_orc_conn,'init')
+                     if not ret:
+                         print 'succcess to manage hmc host',self.args.ip
+                     else:
+                         print 'fail to manage hmc host',i
+                else:
+                     print self.args.ip,'is unreachable,skip to manage'
+            hmc_conn.close()
+            hmc_orc_conn.close()
+                
+        
+        elif sys.argv[1] == 'list':
+            logger_decorate('begin to do list action.','info')
+            listret = searchAllIps()
+            ip_list = ','.join([ str(i[0])  for i in list(listret)])
+            if not ip_list:
+                _(stringc('warn:no data in db.','red'))
+                sys.exit(3)
+            ip_list = ip_list.strip('[]').split(',')
+            pattern = re.compile(r'^(?:(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\.){3}(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)$')
+            for i in ip_list:
+                if not pattern.match(i):
+                    _("error:ip-list should be list type,please confirm.")
+                    logger_decorate('input format not correct,list terminate.','error')
+                    sys.exit(7)
+            searchList(ip_list)
+            logger_decorate('list action finish','info')
+
+        elif sys.argv[1] == 'reset':
+            logger_decorate('begin to do reset action.','info')
+            ip = self.args.ip
+            user = self.args.user
+            keyfile = self.args.keyfile
+            re_con = mdb_con()
+            re_cur = re_con.cursor()
+            re_cur.execute("select distinct ostype from user where ip='%s'" %ip)
+            re_turn = re_cur.fetchone()
+            ostype = re_turn[0] 
+            re_con.close()
+            check_file_validate(keyfile)
+            key = unencrypt(keyfile)
+            logger_decorate('start to check host status.','info')
+            reset_code,reset_stat=commands.getstatusoutput('fping %s' %ip)
+            if reset_code:
+                logger_decorate('host not reachable.reset exit.','warn')
+                stamp = time.strftime("%Y-%m-%d_%H-%M-%S")
+                reset_fail1 = open('/var/pmslog/reset_Fail.log','a')
+                reset_fail1.write('[%s]  SSH Unreachable for %s\n'%(stamp,ip))
+                reset_fail1.close()
+                sys.exit(10)
+            if user == 'hscroot':
+                hmc_conn = mdb_con()
+                hmc_orc_conn = cx_Oracle.connect(ORA_CONINFO)
+                manage_hmc_proc(self.args.ip,hmc_conn,hmc_orc_conn,'update')
+            else:
+                reset_time = 1
+                while reset_time <= 3:
+                    print reset_time
+                    orig_pw = generate_password()
+                    shadow_pw = encrypt_password("%s,%s,%s,%s"%(ip,user,ostype,orig_pw))
+                    logger_decorate('host status ok,start to reset.','info')
+                    margs = 'name=%s password=%s'%(user,shadow_pw)
+                    res = ansible.runner.Runner(module_name = 'user',host_list = [ip,],module_args = margs).run()
+                    print res
+                    if res['dark'] or 'fail' in str(res).lower():
+                        stamp = time.strftime("%Y-%m-%d_%H-%M-%S")
+                        _('Ansible Change Password Failed.')
+                        reset_fail = open('/var/pmslog/reset_Fail.log','a')
+                        reset_fail.write('[%s] Ansible execution Failed %s times for %s\n'%(stamp,reset_time,ip))
+                        print '[Error] '+str(res)+'\n'
+                        reset_fail.write(str(res)+'\n')
+                        reset_fail.close()
+                        if reset_time == 3:
+                            sys.exit(10)
+                        reset_time += 1
+                    elif res['contacted']:
+                        stamp = time.strftime("%Y-%m-%d_%H-%M-%S")
+                        encryptObj = prpcrypt(key)
+                        encrypt_pw = encryptObj.encrypt(orig_pw)
+                        connector = mdb_con()
+                        cur = connector.cursor()
+                        connector.select_db(DB_NAME)
+                        cur.execute('select password1,password2,password3 from user where ip="%s" and name="%s"'%(ip,user))
+                        ftk_out = cur.fetchone()
+                        if ftk_out:
+                            machine = ip
+                            username = user
+                            check_pwd = orig_pw
+                            ssh = paramiko.SSHClient()
+                            ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+                            try:
+                                ssh.connect(machine, username=username, password=check_pwd,look_for_keys=False,allow_agent=False)
+                                reset_lst = list(ftk_out)
+                                if reset_lst:
+                                    tonelist = list_algorithm(encrypt_pw,reset_lst)
+                                    cur.execute("update user set password1='%s',password2='%s',password3='%s',tag=  \
+                                        '%s',checkout_lock='n' where ip='%s' and name='%s'"% (tonelist[0],tonelist[1], \
+                                        tonelist[2],CURRENT_TIME,ip,user))
+                                    connector.commit()
+                                    _('Password Changed Success!')
+                                    logger_decorate('reset  Success.','info')
+                                    connector.close()
+                                    break
+                            except :
+                                reset_fail = open('/var/pmslog/reset_Fail.log','a')
+                                print '[Error]: Ansible user module execute Success,But Password Check Failed'
+                                reset_fail.write('[%s] Ansible user module execute Success,But Password Check Failed %s times for %s\n'%(stamp,reset_time,ip))
+                                reset_fail.close()
+                                reset_time += 1
+                            finally:
+                                ssh.close()
+                        else:
+                            _(stringc("the ip not exists in db,invalid.",'red'))
+                            logger_decorate('the ip not exists in db,invalid.','error')
+                            sys.exit(4)
+                        if reset_time == 3:
+                            sys.exit(10)
+                            
+        elif sys.argv[1] == 'whitelist':
+            location = self.args.location
+            logger_decorate('show whitelist from mysql.','info')
+            connector = mdb_con()
+            white_cur = connector.cursor()
+            if self.args.distinct:
+                white_cur.execute('select DISTINCT member from whitelist where location="%s"'% location)
+            else:
+                white_cur.execute('select member from whitelist where location="%s"'% location)
+            body = list(white_cur.fetchall())
+            connector.close()
+            body.sort(lambda x,y: cmp(x[0].rjust(3, '0') , y[0].rjust(3, '0')))
+            header = [('  whitelist',)]
+            nova_fmt(header,body)
+
+        elif sys.argv[1] == 'incr':
+            location = self.args.location 
+            single_member = self.args.single_member 
+            member_file = self.args.member_file
+            if not single_member and not member_file:
+                sys.exit('at least one option is given "{-m|-f}"')
+            connector = mdb_con()
+            white_cur = connector.cursor()
+            if single_member:
+                logger_decorate('begin to incr ip  to  whitelist.','info')
+                white_cur.execute('insert into whitelist(location,member) values ("%s","%s")'% (location,single_member))
+                connector.commit()
+                logger_decorate('success to incr ip %s  to  whitelist.'%single_member,'info')
+            if member_file:
+                if not os.path.isfile(member_file):
+                    sys.exit('given option -f argument is not a file.')
+                logger_decorate('begin to incr ips  to  whitelist from file.','info')
+                ips = [ i.strip('\n') for i in open(member_file).readlines()]
+                white_cur.executemany('insert into whitelist(location,member) values(%s,%s)',zip(len(ips)*[location],ips))
+                connector.commit()
+                logger_decorate('success to incr ips to  whitelist from file %s.'%member_file,'info')
+                
+        elif sys.argv[1] == 'decr':         
+            location = self.args.location 
+            single_member = self.args.single_member 
+            member_file = self.args.member_file
+            if not single_member and not member_file:
+                sys.exit('at least one option is given "{-m|-f}"')
+            connector = mdb_con()
+            white_cur = connector.cursor()
+            if single_member:
+                logger_decorate('begin to decr ip  from  whitelist.','info')
+                white_cur.execute('delete from  whitelist where location="%s" and member="%s"' %(location,single_member))
+                connector.commit()
+                logger_decorate('success to decr ip %s  from  whitelist.'%single_member,'info')
+            if member_file:
+                if not os.path.isfile(member_file):
+                    sys.exit('given option -f argument is not a file.')
+                logger_decorate('begin to decr ips  to  whitelist from file.','info')
+                ips = [ i.strip('\n') for i in open(member_file).readlines()]
+                white_cur.execute('delete from whitelist where location="%s" and member in %s ' %(location,str(ips).replace('[','(').replace(']',')')))
+                connector.commit()
+                logger_decorate('success to decr ips from  whitelist from file %s.'%member_file,'info')
+
+    def parse_args(self):
+        parser = argparse.ArgumentParser(description="password management.")
+        subparsers = parser.add_subparsers(help='sub-command help')
+        #addEntry
+        addEntry = subparsers.add_parser('add', help='Add single entry to database from input.',
+            description='Add single entry to database from input.')
+                 
+        addEntry.add_argument('--ip','-i',action='store',dest='ip',help='source host ip')
+        addEntry.add_argument('--user','-u',action='store',dest='user',help='host user to be added')
+        addEntry.add_argument('--ostype','-o',action='store',dest='ostype',default=DEFAULT_OS_TYPE,help='host operating system type')
+        addEntry.add_argument('--uuid','-d',action='store',dest='uuid',help='uuid of host')
+        addEntry.add_argument('--hostname','-t',action='store',dest='hostname',help='hostname of host')
+        
+        # pollData
+        pollPassword = subparsers.add_parser('poll', help='poll data from shared view.',
+            description='Poll data from shared view.')
+        
+        # sourcePassword 
+        sourcePassword = subparsers.add_parser('source', help='get source data from oracle.',
+            description='Get source data from oracle')
+        
+        # initPassword 
+        initPassword = subparsers.add_parser('init', help='Initialize data to database from source file.',
+            description='Initialize data to database from source file')
+        initPassword.add_argument('--initial_file','-f',action='store', dest='init',default=DEFAULT_INIT,help='path of source entry file')
+        initPassword.add_argument('--interval_time','-t',action='store',dest='time',default=DEFAULT_INTERVAL,help='time gaps you want(example:1d,1h or 1d1h)')
+
+        # genPassword
+        genPassword = subparsers.add_parser('gen', help='Generate random password regard host and username entry from source file.',
+            description='Generate random password regard host and username entry from source file') 
+        genPassword.add_argument('--source_file',action='store', dest='src',default=DEFAULT_FILTER,help='path of source entry file')
+        genPassword.add_argument('--dest_file',action='store', dest='dest',default=DEFAULT_STORE,help='path of for-db file,which will be created')
+
+        # encryptPassword
+        encryptPassword = subparsers.add_parser('encrypt', help='Password encryption.',
+            description='Password encryption.') 
+        encryptPassword.add_argument('--source_file', '-f',action='store', dest='src',default=DEFAULT_STORE,help='path of for-db file,which will be created')
+        encryptPassword.add_argument('--inventory_file','-i',action='store', dest='inv',default=DEFAULT_PW_INVENTORY,help='path of inventory file,which will be created')
+
+        # updatePassword
+        updatePassword = subparsers.add_parser('update', help='Update password of remote machine.',
+            description='Update password of remote machine.') 
+        updatePassword.add_argument('--inventory_file','-i', action='store', dest='inv',default=DEFAULT_PW_INVENTORY,help='path of inventory file,which will be created')
+
+        # gpgPassword
+        gpgPassword = subparsers.add_parser('gpg', help='GPG encryption of  file.',
+            description='GPG encryption of  file..') 
+        gpgPassword.add_argument('--encrypt','-e', action='store',dest='filename',help=' key file to be converted to encrypted mode.')
+        gpgPassword.add_argument('--init','-i', action='store_true',dest='opt',help='initialize gpg encryption')
+
+        # pingCheckPassword
+        pingPassword = subparsers.add_parser('pingcheck', help='Check pingability of remote machine.',
+            description='Check pingability of remote machine.') 
+        pingPassword.add_argument('--check_file',action='store',dest='ping_chkf',default=DEFAULT_STORE,help='source entry to be ssh-checked')
+
+       
+        # sshCheckPassword
+        sshPassword = subparsers.add_parser('sshcheck', help='Check ssh connectivity of remote machine.',
+            description='Check ssh connectivity of remote machine.') 
+        sshPassword.add_argument('--keyfile','-f',action='store',dest='keyfile',default=DEFAULT_KEY,help='key file used to decrypt enigma')
+
+        # storePassword
+        storePassword = subparsers.add_parser('store', help='Store encryption password to database.',
+            description='Store encryption password to database')
+        storePassword.add_argument('--source_file','-f',action='store',dest='src',default=DEFAULT_STORE,help='path of for-db file')
+        storePassword.add_argument('--keyfile','-k',action='store',dest='keyfile',default=DEFAULT_KEY,help='key file used for encryption')
+        
+        # filterPassword
+        filterPassword = subparsers.add_parser('filter', help='Filter out qualified host and username from database.',
+            description='Filter out qualified host and username from database')
+        filterPassword.add_argument('--dest_file',action='store',dest='dest',default=DEFAULT_FILTER,help=('path of filter file,which will be created'))
+        filterPassword.add_argument('--interval_time',action='store',dest='time',default=DEFAULT_INTERVAL,help='time gap you want(example:1d,1h or 1d1h)')
+
+        # queryPassword
+        queryPassword = subparsers.add_parser('query', help='Query password from database by host and username entry.',
+            description='Query password from database by host and username entry')
+        queryPassword.add_argument('--all','-a',action='store_true',help='whether show history password')
+        queryPassword.add_argument('--raw','-r',action='store_true',help='whether show or not raw password')
+        queryPassword.add_argument('--ip','-i',action='store',dest='ip',help='host ip to be queried')
+        queryPassword.add_argument('--user','-u',action='store',dest='user',help='host user to be queried')
+        queryPassword.add_argument('--keyfile','-k',action='store',dest='keyfile',help='key file used for encryption')
+    
+        
+        # deletePassword
+        deletePassword = subparsers.add_parser('delete', help='Delete record from database by host and username entry.',
+            description='Delete record from database by host and username entry')
+        deletePassword.add_argument('--uuid','-u',action='store',dest='uuid',help='host identified by uuid be removed')
+
+        # SearchByIp
+        SearchByIp = subparsers.add_parser('list', help='Search users from database by ip.',
+            description='Search users from database by ip')
+
+        # resetPassword
+        resetPassword = subparsers.add_parser('reset', help='reset password,reset an entry\'s password immediately.',
+            description='Reset password,reset an entry\'s password immediately')
+        resetPassword.add_argument('--ip','-i',action='store',dest='ip',help='host ip to be reseted')
+        resetPassword.add_argument('--user','-u',action='store',dest='user',help='host user to be reseted')
+        resetPassword.add_argument('--keyfile','-k',action='store',dest='keyfile',help='key file used for encryption')
+        
+        # showWhite
+        showWhite = subparsers.add_parser('whitelist', help='show whitelist ips.',
+            description='show whitelist ips.')
+        showWhite.add_argument('--location','-l',required=True,action='store',dest='location',choices=['sh','sz'],help='location')
+        showWhite.add_argument('--distinct','-d',action='store_true',dest='distinct',help='show unique')
+        
+         # increaseWhite
+        incrWhite = subparsers.add_parser('incr', help='increase ip to whitelist.',
+            description='increase ip to whitelist.')
+        incrWhite.add_argument('--location','-l',required=True,action='store',dest='location',choices=['sh','sz'],help='location')
+        incrWhite.add_argument('--member','-m',action='store',dest='single_member',help='member to be increased')
+        incrWhite.add_argument('--file','-f',action='store',dest='member_file',help='file populated with members to be increased')    
+        
+        # decreaseWhite
+        decrWhite = subparsers.add_parser('decr', help='decrease ip to whitelist.',
+            description='decrease ip to whitelist.')  
+        decrWhite.add_argument('--location','-l',required=True,action='store',dest='location',choices=['sh','sz'],help='location')
+        decrWhite.add_argument('--member','-m',action='store',dest='single_member',help='member to be decreased')
+        decrWhite.add_argument('--file','-f',action='store',dest='member_file',help='file populated with members to be decreased')
+
+         # hmc handler
+        hmcPassword = subparsers.add_parser('hmc', help='pms handle with hmc device.',
+            description='pms handle with hmc device.')  
+        hmcPassword.add_argument('--ip','-i',action='store',dest='ip',help='hmc device ip address')
+        hmcPassword.add_argument('--file','-f',action='store',dest='file',help='file contain multiple column of hmc device ip address')
+            
+        return parser.parse_args()
+
+    def dumpContAsJson(self, cont):
+        print(json.dumps(cont, indent=4))
+
+
+
+def _(text, file=sys.stdout, width=79, nl=1):
+    """A more utilitarian print function for printing help text and error
+    messages.
+    """
+    text = text.strip('\n')
+    if '\n' in text:
+        text = textwrap.dedent(text)
+    text = text.split('\n')
+    for i, line in zip(range(0, len(text)), text):
+        file.write(textwrap.fill(line, width = width))
+        if i < len(text) - 1:
+            file.write('\n')
+    for i in range(0, nl):
+        file.write('\n')
+
+
+def update_key(new_key):
+    connector = mdb_con()
+    cursor = connector.cursor()
+    cursor.execute("update private_key set fingerprint='%s'"% new_key)
+    connector.commit()
+    _("key has been updated successfully.")
+    connector.close()
+
+
+###############
+# genPassword #
+###############
+
+def generate_password(length=8):
+    #random_list = [[1,1,1,5],[1,2,1,4],[1,3,1,3]]
+    alphabet = 'abcdefghjkmnpqrstuvwxyz'
+    upperalphabet = 'ABCDEFGHJKMNPQRSTUVWXYZ'
+    digital = '234567890'
+    special = '&#@!'
+    #render_list = random_list[random.randrange(len(random_list))]
+    #random.shuffle(render_list)
+    al_per = random.sample(list(alphabet),4)
+    upper_per = random.sample(list(upperalphabet),1)
+    dig_per = random.sample(list(digital),1)
+    spec_per = random.sample(list(special),2)
+    pwstring = list(al_per + upper_per + dig_per + spec_per)
+    random.shuffle(pwstring)
+    return ''.join(pwstring)
+
+
+
+def list_algorithm(ele,start):
+    end = start[:]
+    end.pop(2)
+    end.insert(0,ele)
+    return end
+    
+
+def encrypt_password(entry_str):
+    global encrypted_entry
+    entry_str = entry_str.strip()
+    ostype = entry_str.split(',')[2]
+    password_str = entry_str.split(',')[3]
+    entry_seg_ele = entry_str.rstrip(password_str).split(',')
+    entry_seg_ele.remove(ostype)
+    entry_seg = ','.join(entry_seg_ele)
+    if ostype == 'aix':
+      encrypt_password_str = crypt.crypt(password_str, "AD")
+    else:
+      encrypt_password_str = sha256_crypt.encrypt(password_str)
+    entry = entry_seg + encrypt_password_str
+    encrypted_entry.append(entry)
+    return encrypt_password_str
+
+def generate_todolistfor_db_csv(to_do_list,todolistfordb):
+    print todolistfordb
+    csvfile = file(todolistfordb, 'wb')
+    writer = csv.writer(csvfile)
+    try:
+        with open(to_do_list,'rb') as f:
+            rowlists = csv.reader(f)
+            for rowline in rowlists:
+                if rowline[0].strip() and  rowline[1].strip():
+                    src_pass = generate_password()
+                    writer.writerow([rowline[0],rowline[1],rowline[2],src_pass])
+        csvfile.close()
+        gpgCmd = 'pmscmd gpg -e %s'% (todolistfordb)
+        print gpgCmd
+        p = subprocess.Popen(gpgCmd, stdout=subprocess.PIPE, 
+            stderr=subprocess.STDOUT, shell=True)
+
+        while p.poll() is None:
+            out = p.stdout.read(1)
+            sys.stdout.write(out)
+            sys.stdout.flush()
+
+        gpged_store = '%s.gpg'% todolistfordb
+        os.rename(gpged_store,todolistfordb)
+    except IOError as err: 
+        s = "File Error:no such file"
+        s += str(err).split(':')[1]
+        s += ",please provide the file first or use the subcommand to assign a different file path."
+        _(stringc(s,'red'))
+        sys.exit(1)
+
+def generate_todolistfor_db_xls(to_do_list,todolistfordb):
+    csvfile = file(todolistfordb, 'wb')
+    writer = csv.writer(csvfile)
+    data = xlrd.open_workbook(to_do_list)
+    table = data.sheets()[0]
+    rows = table.nrows
+    for i in xrange(rows):
+        if table.row_values[i][0].strip() and table.row_values[i][1].strip():
+            writer.writerow([
+                table.row_values[i][0],
+                table.row_values[i][1],
+                generate_password()])
+                
+def check_share_resource():
+    con_share = None
+    try:
+       con_share = cx_Oracle.connect(ORA_CONINFO)
+    except cx_Oracle.DatabaseError as e:
+       logger_decorate('%s ##'% traceback.format_exc(),'error')
+       logger_decorate('Fail to connect to KanBan oracle,abruptly exit ##','error')
+       sys.exit('Fail to connect to KanBan oracle,abruptly exit')
+    print "connected to oracle,start to polling data..."
+    if con_share:
+        cur_share = con_share.cursor()
+        cur_share.execute("select MAIN_IP,CMDB_ID,HOSTNAME ,status from KANBAN_GUEST.KB_PMS where status like 'null_%'")
+        add_kb = cur_share.fetchall()
+        connector = mdb_con()
+        white_cur = connector.cursor()
+        if add_kb:
+            print "begin to automatically add managed hosts."
+            null_list = list(add_kb)
+            logger_decorate('Start to populate newcomming records to mysql from KANBAN','info')
+            print "Start to populate newcomming records to mysql from KANBAN."
+            for i in null_list:
+                    print "begin to managed %s to mysql" % ','.join(i)
+                    check_ips = [i[0].strip()]
+                    #with open('/etc/ansible/host_list.txt','w') as f:
+                    #    for k in check_ips:
+                    #        f.write(k+'\n')
+                    filter_check_connectable(check_ips)
+                    if not reachable:
+                        print reachable
+                        print "all ips in MAIN_IP not pingable in this entry."
+                        continue
+                    else:
+                        real_ip = reachable[0]
+                        print "real ip in MAIN_IP is %s" % real_ip
+                    white_cur.execute("select * from user where ip='%s' and name='%s'" %(real_ip,i[2]))
+                    exist_entrys = white_cur.fetchall()
+                    if not exist_entrys:
+                        orig_pw = generate_password()
+                        shadow_pw = encrypt_password("%s,%s,%s,%s"%(real_ip,MANAGED_USR,i[3].split('_')[1],orig_pw))
+                        margs = 'name=%s password=%s'%(MANAGED_USR,shadow_pw)
+                        try:
+                            res = ansible.runner.Runner(module_name = 'user',host_list = [real_ip,],module_args = margs).run()
+                        except Exception as ex:
+                            print str(ex)
+                            logger_decorate("Fail to add  %s to mysql" %str(i),'error')
+                            continue
+                        if not res['contacted'] or 'error' in str(res).lower() or 'fail' in str(res).lower():
+                            print stringc('Ansible Change Password Failed for %s.'%real_ip,'red')
+                            cur_share.execute("delete from KANBAN_GUEST.KB_PMS where MAIN_IP = '%s'"% real_ip)
+                            con_share.commit()
+                            with open('/var/pmslog/New_ADD_UNREACH1.csv','a') as f:
+                                f.write(','.join([i[1],i[2],real_ip,MANAGED_USR,i[3]])+"\n")
+                            print stringc("[Error]: %s\n"%res,"red")
+                            continue
+                        else:
+                            print stringc('Ansible Change Password Success','green')
+                            key = unencrypt(DEFAULT_KEY)
+                            encryptObj = prpcrypt(key)
+                            encrypt_pw = encryptObj.encrypt(orig_pw)                    
+                        white_cur.execute('insert into user(ip,name,ostype,uuid,hostname,password1,password2,password3,tag,checkout_lock) values(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)',[real_ip,MANAGED_USR,i[3].split('_')[1],i[1],i[2],encrypt_pw,'','',str(CURRENT_TIME),'n'])
+                        connector.commit()
+                        print stringc("Success to add %s" % str(i),'green')
+                        print "post operation:begin to update kanban data."
+                        cur_share.execute("update KANBAN_GUEST.KB_PMS set MAIN_IP='%s',status='managed' where CMDB_ID='%s'" %(real_ip,i[1]))
+                        con_share.commit()
+                        print "Success to update kanban."
+                    else:
+                        print "the MAIN_IP has existed in mysql,no need to add."
+        else:
+            print "there are none null entry to be managed from kanban."
+            logger_decorate('no record to be add from kb_pms','warn')
+        con_share.close()
+        connector.close()
+        
+             
+             
+def generate_inventory(todolistfordb,dest_inventory):
+    storesource = unencrypt(todolistfordb)
+    storelist = storesource.split('\n')
+    try:
+        cpus = multiprocessing.cpu_count()
+    except NotImplementedError:
+        cpus = 2   # arbitrary default
+    pool = multiprocessing.Pool(processes=cpus)
+    pool.map(encrypt_password, storelist)
+    rawpairdict = {}
+    for rowline in encrypted_entry:
+        rowline=rowline.strip().split(',')
+        if rawpairdict.has_key(rowline[0]):
+            valuelist = []
+            if type(rawpairdict[rowline[0]]) != type([]):
+                valuelist.append(rawpairdict[rowline[0]])
+            else:
+                valuelist.extend(rawpairdict[rowline[0]])
+            valuelist.append("%s,%s"%(rowline[1],rowline[2]))
+            rawpairdict[rowline[0]] = valuelist
+        else:
+            rawpairdict[rowline[0]] = "%s,%s"% (rowline[1],rowline[2])
+    fobj = open(dest_inventory,'w')
+    fobj.write("[all:vars]\nansible_python_interpreter=\"/usr/bin/env python\"\n[all]\n")
+    for triplekey in rawpairdict.keys():
+        if type(rawpairdict[triplekey]) == type([]):
+            sublist = "%s  users=\"{"%triplekey
+            for i in rawpairdict[triplekey]:
+                if i == rawpairdict[triplekey][-1]:
+                    sublist += "'%s': '%s'"%(
+                        i.split(',')[0],i.split(',')[1])
+                else:
+                    sublist += "'%s': '%s', "%(
+                        i.split(',')[0],i.split(',')[1])
+            fobj.write("%s}\"\n"% sublist)
+        else:
+            fobj.write("%s  users=\"{'%s': '%s'}\"\n"%(
+                triplekey,rawpairdict[triplekey].split(',')[0],
+                rawpairdict[triplekey].split(',')[1]))
+    fobj.close()
+    logger_decorate('action encrypt finish,yield destination encryption successfully.','info')
+
+#################
+# storePassword #
+#################
+class prpcrypt():
+    def __init__(self, key):
+        self.key = key
+        self.mode = AES.MODE_CBC
+
+    def encrypt(self, text):
+        cryptor = AES.new(self.key, self.mode, self.key)
+        length = 16
+        count = len(text)
+        add = length - (count % length)
+        text = text + ('\0' * add)
+        self.ciphertext = cryptor.encrypt(text)
+        return b2a_hex(self.ciphertext)
+
+class dbhandler:
+    def __init__(self,conn):
+        self.conn = conn
+        cur = conn.cursor()
+        self.cursor = cur
+        with warnings.catch_warnings():
+            warnings.simplefilter('ignore')
+            conn.select_db(DB_NAME)
+            cur.execute('create table  if not exists  user(id int auto_increment primary key,ip varchar(20),name  varchar(12),ostype varchar(10),uuid varchar(32),hostname varchar(40),password1 varchar(50),password2 varchar(50),password3 varchar(50),tag varchar(20),checkout_lock char(1))')
+            cur.execute('create table  if not exists  whitelist(id int auto_increment primary key,location varchar(8),member varchar(32))')
+            cur.execute('create table  if not exists  private_key(fingerprint char(16))')
+            self.conn.commit()
+
+    def deal_single_data(self,rowline,interval_time):
+        self.cursor.execute("select * from user where ip='%s' and name='%s'" %(rowline[0],rowline[1]))
+        exist_entrys = self.cursor.fetchall()
+        if  exist_entrys:
+            self.cursor.execute("update user set password1='%s',password2='%s',password3='%s',tag='%s',checkout_lock='n' where ip='%s' and name='%s'"% ('','','',str(CURRENT_TIME-interval_time),rowline[0],rowline[1]))
+            self.conn.commit()
+        else:
+            self.cursor.execute('insert into user(ip,name,ostype,uuid,hostname,password1,\
+                password2,password3,tag,checkout_lock) values(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)',rowline)
+            self.conn.commit()
+
+    def update_single_data(self,rowline,con_post):#先取出mysql中保存的旧密码再更新，oracle中保存的记录则直接删除后重新插入
+        # select before store
+        self.cursor.execute("select password1,password2,password3,uuid,ip,hostname from user where ip='%s' and name='%s'" %(rowline[0],rowline[1]))
+        select_out = list(self.cursor.fetchone())
+        org_pass_list = select_out[0:3]
+        append_data = select_out[3:]
+        tonelist = list_algorithm(rowline[2],org_pass_list)
+        self.cursor.execute("update user set password1='%s',password2='%s',password3='%s',tag='%s',checkout_lock='n' where ip='%s' and name='%s'"% (tonelist[0],tonelist[1],tonelist[2],rowline[4],rowline[0],rowline[1]))
+        self.conn.commit()
+        cur_post = con_post.cursor()
+        cur_post.execute("delete from  KANBAN_GUEST.KB_PMS where CMDB_ID='%s'" %append_data[0])
+        con_post.commit()
+        cur_post.execute("insert into KANBAN_GUEST.KB_PMS(CMDB_ID,MAIN_IP,HOSTNAME,STATUS) values('%s','%s','%s','managed')"%(append_data[0],append_data[1],append_data[2]))
+        con_post.commit()
+
+##################
+# addSingleEntry #
+##################
+def handle_single_entry(ip,user,ostype,uuid,hostname,dbworker,interval_time):
+    rowline = [ip,user,ostype,uuid,hostname]
+    rowline.extend(['','',''])
+    tags = CURRENT_TIME - interval_time
+    rowline.append(tags)
+    rowline.append('n')
+    dbworker.deal_single_data(rowline,interval_time)
+
+#################
+# initPassword #
+#################
+def deal_with_csv(key,todolistfordb,dbworker,interval_time):
+    global SSH_NOK
+    global ACTION
+    if ACTION == 'store':
+        if key:
+            encryptObj = prpcrypt(key)
+        else:
+            sys.exit("key not exists")
+        storesource = unencrypt(todolistfordb)
+        storelist = storesource.split('\n')
+        con_post = cx_Oracle.connect(ORA_CONINFO)
+        logger_decorate('login remote oracle,sync managed hosts.','info')
+        for rowline in storelist:
+            rowline = rowline.strip().split(',')
+            ip_user_pair = "%s,%s"%(rowline[0],rowline[1])
+            if ip_user_pair not in SSH_NOK:
+                encryptPass = encryptObj.encrypt(rowline[3])
+                rowline[2] = encryptPass
+                tags = CURRENT_TIME
+                rowline.append(tags)
+                dbworker.update_single_data(rowline,con_post)
+        con_post.close()
+    elif ACTION == 'init':
+        try:
+            with open(todolistfordb,'rb') as f:
+                rowlists = csv.reader(f)
+                for rowline in rowlists:
+                    if  rowline:
+                        rowline = map(lambda x:x.strip(),rowline)
+                    renderline = [rowline[2],rowline[3],rowline[4],rowline[0],rowline[1]]
+                    renderline.extend(['','',''])
+                    tags = CURRENT_TIME - interval_time
+                    renderline.append(tags)
+                    renderline.append('n')
+                    dbworker.deal_single_data(renderline,interval_time)
+            f.close()
+        except IOError as err: 
+            _(stringc("File Error:no such file"+str(err).split(':')[1]+",please provide the file or use the subcommand to assign a different file path.",'red'))
+            sys.exit(1)
+
+
+
+
+def yield_source(conn,delta,src_to_do_list):
+    cursor = conn.cursor()
+    current_time = CURRENT_TIME
+    deadline_time = current_time - delta
+    # choose records inner time range,initialized will instantly be stored
+    cursor.execute('select ip,name,ostype from user where strcmp(tag,%s)<0'% str(deadline_time))
+    csvfile = file(src_to_do_list, 'wb')
+    writer = csv.writer(csvfile)
+    source_triples = cursor.fetchall()
+    if not source_triples:
+        sys.exit("no ip has reach time for password update")
+    conn.close()
+    logger_decorate('hosts matched set time gap has been filtered out,begin to check hosts status.','info')
+    no_repeat_list = []
+    for solo in source_triples:
+        if solo[0] not in no_repeat_list:
+            no_repeat_list.append(solo[0])
+    _("### All qualified hosts filtered by time[total:%s]:"% (len(no_repeat_list),))
+    _("%s"%(no_repeat_list,))
+    t = threading.Thread(target=filter_check_connectable, args=(no_repeat_list,))
+    t.start()
+    _('### Checking hosts status at background, please waiting:')
+    print '==>',
+    sys.stdout.flush()
+    while t.is_alive():
+        sys.stdout.write( ">" )
+        sys.stdout.flush()
+        time.sleep(0.5)
+    _('==')
+    logger_decorate('check hosts status finish.','info')
+    dark_hosts = result['dark']
+    ansible_dic = {}
+    source_audit = open('%s/filter.audit'% AUDIT_DIR,'a')
+    source_audit.write('\n'.rjust(100,'_'))
+    for i in unreachable:
+        ansible_dic[i] = re.sub(' +',' ',dark_hosts[i]['msg'].replace(i,'').replace('\n',' '))
+    v = defaultdict(list)
+    for key, value in sorted(ansible_dic.iteritems()):
+        v[value].append(key)
+    for  j in v.items():
+        source_audit.write('\n### %s[count:%d] ###\n### %s ###\n' %(j[0],len(j[1]),j[1]))
+    source_audit.write('host status which are not pingable[count:%d/total:%d] ###\n %s ###\n'%(len(unreachable),len(unreachable)+len(reachable),unreachable))
+    source_audit.write('host status which are pingable[count:%d/total:%d] ###\n %s ###\n'%(len(reachable),len(unreachable)+len(reachable),reachable))
+    source_audit.close()
+    for solo in source_triples:
+        if reachable:
+            if solo[0] in reachable and solo[1].strip():
+                writer.writerow([solo[0],solo[1],solo[2]])
+        else:
+            sys.exit("WARN:all remote hosts can't be reached.")
+    if len(no_repeat_list)!=len(reachable):
+        _("### Filtered hosts which is pingable[sum:%s]:"% (len(reachable),))
+        _("%s"%(reachable,))
+        logger_decorate('reachable[%s] %s'%(str(len(reachable)),reachable),'debug')
+        _("### Filtered hosts which isn't pingable[sum:%s]:"% (len(unreachable),))
+        _("%s"%(unreachable,))
+        logger_decorate('unreachable[%s] %s'%(str(len(unreachable)),unreachable),'debug')
+        _("### You may fix these hosts right now or continue.")
+    else:
+        _("### defined hosts all pingable")
+    _("### Filtered destination file saved as:")
+    _("%s"% (src_to_do_list))
+    logger_decorate('all pingable[%s] %s'%(str(len(reachable)),reachable),'debug')
+    logger_decorate('action filter finish Success','info')
+
+#################
+# queryPassword #
+#################
+
+def decrypt(text, key):#解密密码？
+    plain_text = []
+    for t in text:
+        cryptor = AES.new(key, 2, key)
+        plain_text.append(cryptor.decrypt(a2b_hex(t.strip())).replace('\x00',''))
+    return plain_text
+
+def getEncrypted(ip,username):
+    connector = mdb_con()
+    cur = connector.cursor()
+    if is_all:
+        query_sql = 'select password1,password2,password3,checkout_lock from user where ip="%s" and name="%s" '% (ip,username)
+    else:
+        query_sql = 'select password1,checkout_lock from user where ip="%s" and name="%s" '% (ip,username)
+    cur.execute(query_sql)
+    ret = cur.fetchone()
+    if ret:
+        ret = list(ret)
+        if ret[-1] == 'y':
+            logger_decorate("WARN:the part %s,%s has been queried."% (ip,username),'warn')
+            sys.exit("WARN:the part %s,%s has been queried."% (ip,username))
+        cur.execute("update user set checkout_lock='y' where ip='%s' and name='%s' " % (ip,username))
+        connector.commit()
+        connector.close()
+        logger_decorate('encryption data query out.','info')
+        ret.pop()
+        return ret
+    else:
+        _(stringc("WARN:the pair '%s,%s' not exists in db."% (ip,username),'red'))
+        logger_decorate('query pair not found in db,query terminate.','error')
+        sys.exit(4)
+
+
+#################
+# deletePassword#
+#################
+def del_invalid_host(uuid):
+    connector = mdb_con()
+    cur = connector.cursor()
+    cur.execute('select count(*) from user where uuid="%s"'% (uuid))
+    ret = cur.fetchone()
+    if ret[0] > 0:
+        cur.execute('delete from user where uuid="%s"'% (uuid))
+        connector.commit()
+        connector.close()  
+        _("delete the uuid entry '%s' successfully."% (uuid))
+        return 0
+    else:
+        _(stringc("WARN:the uuid entry '%s' not exists in db,no need to delete."%uuid,'red'))
+        return 4
+
+#################
+# search list   #
+#################
+def searchList(source_list):
+    if source_list:
+        connector = mdb_con()
+        logger_decorate('log into db,start to search.','info')
+        common_cursor = connector.cursor()
+        header_list = [('ip','machine-uuid','user')]
+        body_list = []
+        for source_ip in source_list:
+            sql = 'select uuid,name from user where ip="%s"'%source_ip
+            common_cursor.execute(sql)
+            results = common_cursor.fetchall()
+            if results:
+                listret = "%s,%s"%(source_ip,','.join(str(results).replace(',','').replace('(','').replace(')','').replace("'",'').split()))
+                body_list.append(tuple(listret.split(',')))
+            else:
+                print "%s==>>%s"%(source_ip,'null')
+        if body_list:
+            body_list.sort(lambda x,y: cmp(x[0].rjust(3, '0') , y[0].rjust(3, '0')))
+            nova_fmt(header_list,body_list)
+        connector.close()
+
+####################
+# ssh checking     #
+####################
+ssh_count = 0
+all_count = 0
+COUNT = 0
+def ssh_parallel_check(fname):
+    global ssh_count,all_count,COUNT
+    storesource = unencrypt(fname)
+    storelist = storesource.split('\n')
+    n = 10
+    all_count = len(storelist)
+    times = len(storelist)/n
+    mod = len(storelist)%n
+    for i in range(0,times):
+            threads = []
+            next_n_lines = storelist[n*i:n*(i+1)]
+            ssh_count += n
+            if next_n_lines:
+                for line in next_n_lines:
+                    linelist = line.strip('\r\n').split(',')
+                    host = line.strip('\r\n').split(',')[0]
+                    t = threading.Thread(target=ssh_check, args=(linelist,))
+                    t.start()
+                    threads.append(t)
+                for t in threads:
+                    t.join()
+    if mod:            
+        remain_lines=storelist[-mod:]
+        ssh_count += mod
+        remain_threads = []
+        for line in remain_lines:
+            linelist = line.strip('\r\n').split(',')
+            host = line.strip('\r\n').split(',')[0]
+            t = threading.Thread(target=ssh_check, args=(linelist,))
+            t.start()
+            remain_threads.append(t)
+        for t in remain_threads:
+            t.join()
+    if SSH_NOK:
+        print
+        _("##ssh nok ip[total:%s]" %len(SSH_NOK))
+        _("%s"%(SSH_NOK))
+        logger_decorate('unsshable[%s] %s'%(str(len(SSH_NOK)),SSH_NOK),'debug')
+    else:
+        print 
+        _("##all filtered hosts are ssh-reachable")
+
+#########################
+# check ssh connectivity#
+#########################
+def ssh_check(entry):
+    global SSH_NOK
+    machine = entry[0]
+    user = entry[1]
+    passa = entry[3]
+    ssh = paramiko.SSHClient()  
+    ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+    cmd = "/bin/hostname"
+    try:
+        ssh.connect(machine, username=user, password=passa,look_for_keys=False,allow_agent=False)
+        stdin, stdout, stderr = ssh.exec_command(cmd)
+    except :
+        SSH_NOK.append("%s,%s"%(machine,user))
+    finally:
+        ssh.close()  
+
+def searchAllIps():
+    connector = mdb_con()
+    dbworker = dbhandler(connector)
+    search_cur = dbworker.cursor
+    search_cur.execute('select ip from user')
+    rets = search_cur.fetchall()
+    search_cur.close()
+    connector.close()
+    return  set(rets)
+
+
+
+#########################
+#     nova format       #
+#########################
+def nova_fmt(header,body):
+    l = tuple(header+body)
+    col_len = [max([len(i) for i in grp])for grp in zip(*l)]
+    banner_left = ' +'
+    banner_mid = ['-'*(i+2)+'+' for i in col_len]
+    banner = banner_left + ''.join(banner_mid)
+    print banner
+    hor = [
+    [str(s).ljust(max(len(str(i)) for i in grp)) for s in grp]
+    for grp in zip(*l)]
+    ver = zip(*hor)
+    print " | " + " | ".join(ver.pop(0)) + " |"
+    print banner
+    for p in [" | ".join(row) for row in ver]:
+        print " | " + p + " |"
+    print banner
+
+def check_file_validate(fname):
+    if not fname:
+        _(stringc('error:key file must be provided','red'))
+        sys.exit(4)
+    elif not os.path.exists(fname):
+        _(stringc('error:key file not exists.','red'))
+        sys.exit(5)
+    elif not fname.endswith('gpg'):
+        _(stringc('error:key file must a gpg encryption file','red'))
+        sys.exit(6)
+
+#########################
+#     decryption        #
+#########################
+def unencrypt(fname):
+    unencrypt_shell = 'echo "12345678" | gpg --batch --passphrase-fd 0 --decrypt %s 2>/dev/null' %fname
+    #print unencrypt_shell
+    derc,dere = commands.getstatusoutput(unencrypt_shell)
+    #print dere
+    if derc == 0:
+        return dere
+    else:
+        _(stringc("Error:Fail to analysis %s,may be it is not a gpg-encrypted file." %fname,'red'))
+        sys.exit(4)
+        
+def manage_hmc_proc(i,hmc_conn,hmc_orc_conn,action):
+    key = unencrypt(DEFAULT_KEY)
+    orig_pw = generate_password()
+    encryptObj = prpcrypt(key)
+    p  = encryptObj.encrypt(orig_pw)
+    ret_code = specific_hmc_handler(i,orig_pw)#hmc的纳管是直接先通过执行shell修改密码，修改密码用的是明文，保存时用的是密文
+    if ret_code == 5:
+        return ret_code
+    hmc_cur = hmc_conn.cursor()
+    hmc_orc_cur = hmc_orc_conn.cursor()
+    if action == 'init':
+        hmc_cur.execute("insert into user(ip,name,ostype,uuid,hostname,password1,password2,password3,tag,checkout_lock) values('%s','hscroot','hmc','hmc','','%s','','','%s','n')" %(i,p,str(time.time())))
+        hmc_orc_cur.execute("insert into KANBAN_GUEST.KB_PMS(CMDB_ID,MAIN_IP,HOSTNAME,STATUS) values('','%s','hmc','managed')" %i)
+    elif action == 'update':
+        hmc_cur.execute("update user set checkout_lock='n',password1='%s',tag='%s' where ip='%s'" %(p,str(time.time()),i))
+    hmc_conn.commit()
+    hmc_orc_conn.commit()
+
+def specific_hmc_handler(ip,password,username='hscroot'):
+    password = password.replace('!','\!').replace('&','\&').replace('$','\$').replace('@','\@').replace('#','\#')
+    shell_cmd = "chhmcusr  -u '%s' -t passwd -v '%s'" %(username,password)
+    cmd = 'ssh  -o GSSAPIAuthentication=no -o  StrictHostKeyChecking=no   -l {0} {1} {2}'.format(username,ip,shell_cmd)
+    hmc_rc,hmc_ret = commands.getstatusoutput(cmd)
+    if hmc_rc == 0:
+       print 'successfully update hmc host password',ip
+    else:
+       print hmc_ret
+       return 5
+        
+#####################
+# logger decoration #
+#####################
+def logger_decorate(msg,level):
+   extend = "  ##   domain=%s id=%s host=%s  user=%s "%(os.getenv("domain",
+          "local"),os.getenv("id",'unknown_id'),os.getenv("host",'localhost'),os.getenv("user","root"))
+   msg = msg + extend
+   eval("logger.%s"%level)(msg)
+   
+#####################
+# open detail log   #
+#####################
+def handle_pb_log(action):
+    config = ConfigParser.RawConfigParser()
+    config.read(ANSIBLE_CFG)
+    if action == "open":
+        config.set('defaults', 'log_path', '%s/update.audit'% AUDIT_DIR)
+    elif action == "close":
+        config.remove_option('defaults', 'log_path')
+    with open(ANSIBLE_CFG, 'wb') as configfile:
+        config.write(configfile)
+
+#################
+# play ansible  #
+#################
+def start_ansible(inventory_f):
+    handle_pb_log('open')
+    del sys.modules['ansible.constants']
+    reload(callbacks)
+    temp = tempfile.NamedTemporaryFile()
+    temp.write('-\n hosts: all\n gather_facts: False\n tasks:\n    - user: name={{item.key}}  update_password=always password={{item.value}}\n      with_dict: "{{users}}"\n')
+    temp.seek(0)
+    example_inventory = ansible.inventory.Inventory(inventory_f)
+    stats = callbacks.AggregateStats()
+    playbook_cb = callbacks.PlaybookCallbacks()
+    runner_cb = callbacks.PlaybookRunnerCallbacks(stats)
+    pb = ansible.playbook.PlayBook(
+        playbook = temp.name,
+        stats = stats,
+        callbacks = playbook_cb,
+        runner_callbacks = runner_cb,
+        inventory = example_inventory,
+        forks = 100
+        )
+    pr = pb.run()
+    temp.close()
+    handle_pb_log('close')
+    return pr
+
+if __name__ == '__main__':
+#    LOG_DIR = '/var/log/%s_pms'% time.strftime("%Y_%m_%d")
+    LOG_DIR = '/var/pmslog'
+    AUDIT_DIR = os.path.join(LOG_DIR,'audit')
+    if not os.path.isdir(LOG_DIR):
+        os.makedirs(LOG_DIR)
+    if not os.path.isdir(AUDIT_DIR):
+        os.makedirs(AUDIT_DIR)
+    cmd = sys.argv[1]
+    LOG_PATH = os.path.join(LOG_DIR,"%s_pms.log"%cmd)
+    logger = logging.getLogger('pms')
+    logger.setLevel(logging.DEBUG)
+    fh = logging.FileHandler(LOG_PATH)
+    formatter = logging.Formatter('time=%(asctime)s  %(filename)s[line:%(lineno)d] %(levelname)s  operation=%(message)s ' ) 
+    fh.setFormatter(formatter) 
+    logger.addHandler(fh)
+    PasswordManagement()
+

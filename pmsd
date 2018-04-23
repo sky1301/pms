@@ -1,0 +1,74 @@
+#!/usr/bin/env python
+#encoding=utf-8
+import os
+import sys
+import commands
+import logging
+#from flask import Flask,jsonify,abort,make_response,request
+import commands
+from multiprocessing import Process
+import signal
+
+
+
+def pmsd_status():
+    global RUN
+    byport_code,byport_res = commands.getstatusoutput("cat /var/run/pmsd.pid")
+    if not byport_code:
+        pids_byport = sorted(byport_res.split('\n'))
+    bycmd_code,bycmd_res = commands.getstatusoutput("ps -ef|grep -w  '%s'|grep start|grep -v grep|awk '{print $2}'" %sys.argv[0])
+    if not byport_code:
+        pids_bycmd = sorted(bycmd_res.split('\n'))
+        current_pid = os.getpid()
+        if str(current_pid) in pids_bycmd:
+            pids_bycmd.remove(str(current_pid))
+    if len(pids_byport) > 1 :#== pids_bycmd and  ''.join(pids_byport):
+        print "pmsd is running..."
+        RUN = 'on'
+
+        return pids_byport
+    else:
+        RUN = 'off'
+        if sys.argv[1] != "restart":
+            pass
+            print "pmsd is stopped..."
+        
+def pmsd_start():
+
+    os.system("nohup uwsgi /media/sf_Documents/python_project/ansible1.9API/nginx_uwsgi.ini >> /tmp/uwsgi.log 2>&1 &")
+    print "Start pmsd:"," "*13,"[ ","\033["+"0;32"+"m"+'OK'+"\033[0m"," ]"
+    os._exit(0)
+    print "pmsd start Failed,use 'pmsd status' to  check whether it has been running"
+       
+def pmsd_stop():
+    byport_code,byport_res = commands.getstatusoutput("cat /var/run/pmsd.pid")
+    if not byport_code:
+        pids = sorted(byport_res.split('\n'))
+    if 1 == 'on':
+        return
+    else:
+        print "Begin to stop pmsd"
+        os.system("kill -9 %s"%pids[0])
+            #os.kill(int(i),signal.SIGTERM)
+        print "Stopping pmsd:"," "*10,"[ ","\033["+"0;32"+"m"+'OK'+"\033[0m"," ]"   
+
+
+if __name__=='__main__':
+   if len(sys.argv) != 2:
+       print "Usage: pmsd {start|stop|status|restart}"
+       sys.exit(1)
+   if sys.argv[1] == 'start':
+       pmsd_start()
+   elif sys.argv[1] == 'status':
+       pmsd_status()
+   elif sys.argv[1] == 'stop':
+       pmsd_stop()
+   elif sys.argv[1] == 'restart':
+       pmsd_stop()
+       pmsd_start()
+   else:
+       print "Usage: pmsd {start|stop|status|restart}"
+           
+                  
+    
+   
